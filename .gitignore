@@ -1,2 +1,20 @@
+# Ignore virtual environment folders
+.venv/
+venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore local data files
 memories.json
 app.py.save
+memories.json
+app.py.save
+
+# Per-user memory files (private)
+user_data/
+memories*.json
+
+# Ignore local Streamlit secrets/configs
+.streamlit/
