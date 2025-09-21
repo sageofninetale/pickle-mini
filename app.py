@@ -1,24 +1,48 @@
-# Pickle Mini – Save, Search, and Ask (Local Q&A, no API)
-# Football analogy:
-# - JSON file = your scouting binder
-# - Search = analyst filters reports
-# - Local Q&A = simple coach logic that answers from the reports
-
-import json, os, re
+import os, json, uuid
 from datetime import datetime
 import streamlit as st
+from streamlit_cookies_manager import EncryptedCookieManager
 
-MEMORY_FILE = "memories.json"
+# --- Per-user ID via encrypted cookies ---
+# (Set a password in Streamlit secrets on the cloud; local dev uses fallback.)
+COOKIE_PASSWORD = st.secrets.get("COOKIE_PASSWORD", "dev-not-secret")
+
+cookies = EncryptedCookieManager(
+    prefix="pickle_",          # keeps cookies for this app separate
+    password=COOKIE_PASSWORD,  # encrypts cookie value
+)
+
+# Wait until cookies are ready (first run); then continue.
+if not cookies.ready():
+    st.stop()
+
+# Issue a permanent user_id if not already present
+if "user_id" not in cookies:
+    cookies["user_id"] = str(uuid.uuid4())
+    cookies.save()
+
+user_id = cookies["user_id"]
+
+# Store each user's memories in its own file inside user_data/
+DATA_DIR = "user_data"
+os.makedirs(DATA_DIR, exist_ok=True)
+USER_MEMORY_FILE = os.path.join(DATA_DIR, f"mem_{user_id}.json")
 
 # ---------- Helpers: load/save memories ----------
 def load_memories():
-    if not os.path.exists(MEMORY_FILE):
+    # If no file exists yet, return an empty list
+    if not os.path.exists(USER_MEMORY_FILE):
         return []
-    with open(MEMORY_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(USER_MEMORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        # In case of JSON errors or corrupted file
+        return []
 
 def save_memories(memories):
-    with open(MEMORY_FILE, "w") as f:
+    # Save memories to the user's specific JSON file
+    with open(USER_MEMORY_FILE, "w") as f:
         json.dump(memories, f, indent=2)
 
 # ---------- App ----------
