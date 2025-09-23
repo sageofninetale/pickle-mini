@@ -19,6 +19,10 @@ TABLE_NAME = "Memories"  # Supabase table where we'll store user memories
 # ---------- Helpers: load/save memories (Supabase) ----------
 
 def load_memories_from_db(user_id: str, search_term: str = ""):
+    # If we somehow got here without a user_id, don't query the database
+    if not user_id:
+        return []
+
     try:
         q = (
             supabase
@@ -27,13 +31,18 @@ def load_memories_from_db(user_id: str, search_term: str = ""):
             .eq("user_id", user_id)
             .order("created_at", desc=True)
         )
+
         if search_term.strip():
             # Case-insensitive search on memory_text
             q = q.ilike("memory_text", f"%{search_term.strip()}%")
 
         resp = q.execute()
-        data = resp.data or []
-        return [
+        return resp.data or []
+
+    except Exception as e:
+        # Optional: Log the error for debugging
+        st.error(f"Error loading memories: {str(e)}")
+        return []
             {
                 "id": row.get("id"),
                 "created_at": row.get("created_at"),
@@ -59,25 +68,26 @@ def save_memory_to_db(user_id: str, text: str, importance: int = 3):
     except Exception as e:
         st.error(f"Couldn't save memory: {e}")
         return False
+
 # --- Per-user ID via encrypted cookies ---
 # (Set a password in Streamlit secrets on the cloud; local dev uses fallback.)
 COOKIE_PASSWORD = st.secrets.get("COOKIE_PASSWORD", "dev-not-secret")
 
 cookies = EncryptedCookieManager(
-    prefix="pickle_",          # keeps cookies for this app separate
-    password=COOKIE_PASSWORD,  # encrypts cookie value
+    prefix="pickle_",
+    password=COOKIE_PASSWORD,
 )
 
 # Wait until cookies are ready (first run); then continue.
 if not cookies.ready():
     st.stop()
 
-# Issue a permanent user_id if not already present
-if "user_id" not in cookies:
-    cookies["user_id"] = str(uuid.uuid4())
+# FIXED: Always get or create a permanent user_id cookie
+user_id = cookies.get("user_id")   # safer than cookies["user_id"]
+if not user_id:
+    user_id = str(uuid.uuid4())    # generate a unique UUID
+    cookies["user_id"] = user_id
     cookies.save()
-
-user_id = cookies["user_id"]
 
 # ---------- Helpers: load/save memories ----------
 def load_memories():
