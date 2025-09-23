@@ -3,6 +3,62 @@ from datetime import datetime
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
+# --- Add Supabase Setup Here ---
+from supabase import create_client
+
+# Load secrets
+SUPABASE_URL = st.secrets["SUPABASE_URL"].strip()
+SUPABASE_SERVICE_KEY = st.secrets["SUPABASE_SERVICE_KEY"].strip()
+
+# Create Supabase client
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# Table name
+TABLE_NAME = "Memories"  # Supabase table where we'll store user memories
+
+# ---------- Helpers: load/save memories (Supabase) ----------
+
+def load_memories_from_db(user_id: str, search_term: str = ""):
+    try:
+        q = (
+            supabase
+            .table(TABLE_NAME)
+            .select("id, created_at, memory_text, importance")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+        )
+        if search_term.strip():
+            # Case-insensitive search on memory_text
+            q = q.ilike("memory_text", f"%{search_term.strip()}%")
+
+        resp = q.execute()
+        data = resp.data or []
+        return [
+            {
+                "id": row.get("id"),
+                "created_at": row.get("created_at"),
+                "text": row.get("memory_text", ""),
+                "importance": row.get("importance", 3),
+            }
+            for row in data
+        ]
+    except Exception as e:
+        st.error(f"Couldn't load memories: {e}")
+        return []
+
+
+def save_memory_to_db(user_id: str, text: str, importance: int = 3):
+    try:
+        payload = {
+            "user_id": user_id,
+            "memory_text": text.strip(),
+            "importance": int(importance),
+        }
+        _ = supabase.table(TABLE_NAME).insert(payload).execute()
+        return True
+    except Exception as e:
+        st.error(f"Couldn't save memory: {e}")
+        return False
 # --- Per-user ID via encrypted cookies ---
 # (Set a password in Streamlit secrets on the cloud; local dev uses fallback.)
 COOKIE_PASSWORD = st.secrets.get("COOKIE_PASSWORD", "dev-not-secret")
@@ -22,11 +78,6 @@ if "user_id" not in cookies:
     cookies.save()
 
 user_id = cookies["user_id"]
-
-# Store each user's memories in its own file inside user_data/
-DATA_DIR = "user_data"
-os.makedirs(DATA_DIR, exist_ok=True)
-USER_MEMORY_FILE = os.path.join(DATA_DIR, f"mem_{user_id}.json")
 
 # ---------- Helpers: load/save memories ----------
 def load_memories():
@@ -55,7 +106,8 @@ search_term = st.text_input(
     placeholder="e.g., Arsenal, Mum, Physio"
 )
 
-all_memories = load_memories()
+# Load from Supabase for this user (and optional search)
+all_memories = load_memories_from_db(user_id, search_term)
 
 # Two columns: add + results
 col_left, col_right = st.columns(2)
@@ -69,42 +121,33 @@ with col_left:
     )
     importance = st.slider("Importance (1 = low, 5 = high)", 1, 5, 3)
 
-    if st.button("Save memory", type="primary"):
-        if mem_text.strip():
-            new_mem = {
-                "text": mem_text.strip(),
-                "importance": int(importance),
-                "ts": datetime.now().isoformat()
-            }
-            all_memories.append(new_mem)
-            save_memories(all_memories)
+if st.button("Save memory", type="primary"):
+    if mem_text.strip():
+        ok = save_memory_to_db(user_id, mem_text, importance)
+        if ok:
             st.success("✅ Memory saved.")
-        else:
-            st.warning("Please type something before saving.")
+            st.rerun()  # reload list from DB
+    else:
+        st.warning("Please enter some text before saving.")
 
-# ---- Right: Results (filtered or all) ----
+# ---- Results (from DB) ----
 with col_right:
     st.subheader("📁 Results")
-
     if not all_memories:
         st.info("No memories yet. Add one on the left.")
-        filtered = []
     else:
-        if search_term.strip():
-            filtered = [m for m in all_memories if search_term.lower() in m["text"].lower()]
-        else:
-            filtered = all_memories
+        for m in all_memories:
+            # Be tolerant of old local keys: 'text'/'ts' vs new DB keys: 'memory_text'/'created_at'
+            text = m.get("memory_text") or m.get("text") or ""
+            created = (m.get("created_at") or m.get("ts") or "")
+            created_display = created.replace("T", " ")[:16] if isinstance(created, str) else ""
+            imp = m.get("importance", "")
 
-        if not filtered:
-            st.warning("No matches found.")
-        else:
-            for m in reversed(filtered):
-                st.markdown(
-                    f"**{m['text']}**  \n"
-                    f"_Saved: {m['ts'][:16].replace('T',' ')} • Importance {m['importance']}_"
-                )
-                st.divider()
-
+            st.markdown(
+                f"**{text}**  \n"
+                f"<span style='color:#999'>Saved: {created_display} • Importance {imp}</span>",
+                unsafe_allow_html=True,
+            )
 import os, requests
 
 # ----------- Groq Q&A (API) -----------
