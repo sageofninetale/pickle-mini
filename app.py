@@ -43,7 +43,7 @@ def load_memories_from_db(user_id: str, search_term: str = ""):
         # Optional: Log the error for debugging
         st.error(f"Error loading memories: {str(e)}")
         return []
-            {
+            
                 "id": row.get("id"),
                 "created_at": row.get("created_at"),
                 "text": row.get("memory_text", ""),
