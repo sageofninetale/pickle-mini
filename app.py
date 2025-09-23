@@ -44,18 +44,6 @@ def load_memories_from_db(user_id: str, search_term: str = ""):
         st.error(f"Error loading memories: {str(e)}")
         return []
             
-                "id": row.get("id"),
-                "created_at": row.get("created_at"),
-                "text": row.get("memory_text", ""),
-                "importance": row.get("importance", 3),
-            }
-            for row in data
-        ]
-    except Exception as e:
-        st.error(f"Couldn't load memories: {e}")
-        return []
-
-
 def save_memory_to_db(user_id: str, text: str, importance: int = 3):
     try:
         payload = {
