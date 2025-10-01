@@ -1,3 +1,4 @@
 streamlit
 supabase>=2.9
 streamlit-cookies-manager==0.2.0
+dateparser==1.2.0

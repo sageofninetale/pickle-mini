@@ -1,269 +1,386 @@
-import os, json, uuid
-from datetime import datetime
-import streamlit as st
-from streamlit_cookies_manager import EncryptedCookieManager
+# ─────────────────────────────────────────────────────────
+# 0. Page config  (MUST be the first Streamlit command)
+# ─────────────────────────────────────────────────────────
+import streamlit as st  # ensure streamlit is imported before using it
 
-# --- Add Supabase Setup Here ---
-from supabase import create_client
+st.set_page_config(
+    page_title="Pickle Mini",
+    page_icon="🧠",
+    layout="wide",                    # use "wide" or "centered"
+    initial_sidebar_state="collapsed"
+)
 
-# Load secrets
-SUPABASE_URL = st.secrets["SUPABASE_URL"].strip()
-SUPABASE_SERVICE_KEY = st.secrets["SUPABASE_SERVICE_KEY"].strip()
+# =========================
+# 1) IMPORTS & THEME SETUP
+# =========================
 
-# Create Supabase client
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+import os                                  # misc utilities
+import re                                  # regex for extraction
+import uuid                                # to generate per-user IDs
+from datetime import datetime              # timestamps if you need them
+from streamlit_cookies_manager import EncryptedCookieManager  # per-user cookie IDs
+from supabase import create_client         # Supabase client
 
-# Table name
-TABLE_NAME = "Memories"  # Supabase table where we'll store user memories
+# ---- Theme / CSS (lightweight) ----
+st.markdown("""                               
+<style>
+/* container width + paddings */
+.block-container {max-width: 980px; padding-top: 1.4rem; padding-bottom: 2rem;}
+/* compact, readable headings */
+h1, h2, h3 { letter-spacing:.3px; }
+/* subtle small text */
+.small-muted { color:#9aa0a6; font-size:.92rem; }
+/* soft panel for debug */
+.debug-box { background:#12141a; border:1px solid #23262f; padding:.8rem 1rem; border-radius:10px; }
+</style>
+""", unsafe_allow_html=True)               # inject small CSS
 
-# ---------- Helpers: load/save memories (Supabase) ----------
 
-def load_memories_from_db(user_id: str, search_term: str = ""):
-    # If we somehow got here without a user_id, don't query the database
-    if not user_id:
-        return []
+# ===============================
+# 2) SUPABASE CLIENT & CONSTANTS
+# ===============================
 
-    try:
-        q = (
-            supabase
-            .table(TABLE_NAME)
-            .select("id, created_at, memory_text, importance")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-        )
+SUPABASE_URL = st.secrets["SUPABASE_URL"].strip()                  # Supabase URL
+SUPABASE_SERVICE_KEY = st.secrets["SUPABASE_SERVICE_KEY"].strip()  # Service key (server-side)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)       # Supabase client
 
-        if search_term.strip():
-            # Case-insensitive search on memory_text
+TABLE_NAME = "Memories"                                            # table name
+
+
+# =======================================
+# 3) PER-USER ID (ENCRYPTED COOKIE SETUP)
+# =======================================
+
+cookies = EncryptedCookieManager(                                  # create encrypted cookie bucket
+    prefix="pickle_",                                             # isolate cookies per app
+    password=st.secrets["COOKIE_PASSWORD"]                        # encryption key
+)
+
+if not cookies.ready():                                           # on first run cookies may not be ready
+    st.stop()                                                     # rerun until ready
+
+user_id = cookies.get("user_id")                                  # read user_id if present
+if not user_id:                                                   # if missing, create one
+    user_id = str(uuid.uuid4())                                   # generate UUID
+    cookies["user_id"] = user_id                                  # store it
+    cookies.save()                                                # persist the cookie
+
+
+# ======================================
+# 4) DB HELPERS: LOAD & SAVE MEMORIES
+# ======================================
+
+def load_memories_from_db(user_id: str, search_term: str = "") -> list[dict]:
+    """Return a list of memories for this user, optionally filtered by a search term."""
+    if not user_id:                                               # guard
+        return []                                                 # nothing to query
+    try:                                                          # handle DB errors cleanly
+        q = (supabase.table(TABLE_NAME)                           # base query
+                     .select("id, created_at, memory_text, importance")
+                     .eq("user_id", user_id)
+                     .order("created_at", desc=True))
+        if search_term.strip():                                   # case-insensitive contains
             q = q.ilike("memory_text", f"%{search_term.strip()}%")
+        resp = q.execute()                                        # run
+        return resp.data or []                                    # normalize
+    except Exception as e:                                        # show error but don't crash UI
+        st.error(f"Error loading memories: {e}")
+        return []                                                 # safe fallback
 
-        resp = q.execute()
-        return resp.data or []
 
-    except Exception as e:
-        # Optional: Log the error for debugging
-        st.error(f"Error loading memories: {str(e)}")
-        return []
-            
-def save_memory_to_db(user_id: str, text: str, importance: int = 3):
+def save_memory_to_db(user_id: str, text: str, importance: int = 3) -> bool:
+    """Insert a memory row for this user."""
     try:
-        payload = {
+        payload = {                                               # row payload
             "user_id": user_id,
             "memory_text": text.strip(),
             "importance": int(importance),
         }
-        _ = supabase.table(TABLE_NAME).insert(payload).execute()
-        return True
+        _ = supabase.table(TABLE_NAME).insert(payload).execute()  # insert
+        return True                                               # success
     except Exception as e:
-        st.error(f"Couldn't save memory: {e}")
-        return False
+        st.error(f"Couldn't save memory: {e}")                    # surface error
+        return False                                              # failure
+# ==============================================================
+# ================================================================
+# 5) Q&A MATCHER — clean, second-person answers with personality
+#    (Drop-in replacement; safe to paste as a whole block)
+# ================================================================
+# line-tag:QAMATCHER-SECTION-START
 
-# --- Per-user ID via encrypted cookies ---
-# (Set a password in Streamlit secrets on the cloud; local dev uses fallback.)
-COOKIE_PASSWORD = st.secrets.get("COOKIE_PASSWORD", "dev-not-secret")
+# 5.1 Imports / stopwords ----------------------------------------
+import re  # keep near top if you already import re elsewhere
 
-cookies = EncryptedCookieManager(
-    prefix="pickle_",
-    password=COOKIE_PASSWORD,
+STOPWORDS = {
+    "a","an","the","is","are","to","of","and","on","at","by","for","in","with",
+    "this","that","today","tonight","sunday","monday","tuesday","wednesday",
+    "thursday","friday","saturday","my","me"
+}
+
+# 5.2 Tiny tokenizer ---------------------------------------------
+def _tokens(text: str) -> list[str]:
+    """Lowercase, alnum tokens minus stopwords."""
+    words = re.findall(r"[a-z0-9']+", (text or "").lower())
+    return [w for w in words if w not in STOPWORDS]
+
+# --- Multi-task detection + scoring helpers (NEW) ----------------
+MULTI_Q_HINTS = (
+    "today", "tonight", "this evening", "this afternoon", "this morning",
+    "to do", "todo", "tasks", "things", "everything", "all the things",
+    "what are all", "what do i have", "what should i do"
 )
 
-# Wait until cookies are ready (first run); then continue.
-if not cookies.ready():
-    st.stop()
+def _wants_multi(question: str) -> bool:
+    q = (question or "").lower()
+    return any(h in q for h in MULTI_Q_HINTS)
 
-# FIXED: Always get or create a permanent user_id cookie
-user_id = cookies.get("user_id")   # safer than cookies["user_id"]
-if not user_id:
-    user_id = str(uuid.uuid4())    # generate a unique UUID
-    cookies["user_id"] = user_id
-    cookies.save()
+def _score_overlap(q_tokens: set[str], text: str) -> int:
+    m_tokens = set(_tokens(text))
+    return len(q_tokens & m_tokens)
 
-# ---------- Helpers: load/save memories ----------
-def load_memories():
-    # If no file exists yet, return an empty list
-    if not os.path.exists(USER_MEMORY_FILE):
-        return []
-    try:
-        with open(USER_MEMORY_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        # In case of JSON errors or corrupted file
-        return []
-
-def save_memories(memories):
-    # Save memories to the user's specific JSON file
-    with open(USER_MEMORY_FILE, "w") as f:
-        json.dump(memories, f, indent=2)
-
-# ---------- App ----------
-st.title("🟢 Pickle Mini – Personal Memories")
-
-# ---- Search bar ----
-st.subheader("🔍 Search memories")
-search_term = st.text_input(
-    "Type a word to find specific memories",
-    placeholder="e.g., Arsenal, Mum, Physio"
-)
-
-# Load from Supabase for this user (and optional search)
-all_memories = load_memories_from_db(user_id, search_term)
-
-# Two columns: add + results
-col_left, col_right = st.columns(2)
-
-# ---- Left: Add memory ----
-with col_left:
-    st.subheader("➕ Save a new memory")
-    mem_text = st.text_area(
-        "What should Pickle remember?",
-        placeholder="e.g., Arsenal vs Man City at the Emirates, Sunday 4:30pm"
-    )
-    importance = st.slider("Importance (1 = low, 5 = high)", 1, 5, 3)
-
-if st.button("Save memory", type="primary"):
-    if mem_text.strip():
-        ok = save_memory_to_db(user_id, mem_text, importance)
-        if ok:
-            st.success("✅ Memory saved.")
-            st.rerun()  # reload list from DB
-    else:
-        st.warning("Please enter some text before saving.")
-
-# ---- Results (from DB) ----
-with col_right:
-    st.subheader("📁 Results")
-    if not all_memories:
-        st.info("No memories yet. Add one on the left.")
-    else:
-        for m in all_memories:
-            # Be tolerant of old local keys: 'text'/'ts' vs new DB keys: 'memory_text'/'created_at'
-            text = m.get("memory_text") or m.get("text") or ""
-            created = (m.get("created_at") or m.get("ts") or "")
-            created_display = created.replace("T", " ")[:16] if isinstance(created, str) else ""
-            imp = m.get("importance", "")
-
-            st.markdown(
-                f"**{text}**  \n"
-                f"<span style='color:#999'>Saved: {created_display} • Importance {imp}</span>",
-                unsafe_allow_html=True,
-            )
-import os, requests
-
-# ----------- Groq Q&A (API) -----------
-def ask_groq(question, memories):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return None  # No key -> fall back to local
-
-    # Build compact evidence from memories
-    lines = []
-    for m in memories:
-        when = m.get("ts", "")[:16].replace("T", " ")
-        lines.append(f"- ({when}, importance {m.get('importance', 3)}): {m.get('text', '')}")
-    evidence = "\n".join(lines) if lines else "(no memories yet)"
-
-    # What we want the AI to do (more natural wording)
-    system_msg = (
-        "You are Pickle Mini, a helpful assistant that recalls personal memories like a human would. "
-        "Use natural, conversational language. Always include the subject so the sentence feels complete. "
-        "Examples:\n"
-        "- If asked 'Who are Arsenal playing?', reply: 'Arsenal are playing Manchester City.'\n"
-        "- If asked 'Where are Arsenal playing?', reply: 'Arsenal are playing at their home stadium, the Emirates, in London.'\n"
-        "Answer ONLY using the provided memories. "
-        "If the information is not in the memories, say 'I don't know.' "
-        "Be clear and helpful."
-    )
-
-    # What the user is asking (clean multi-line string)
-    user_msg = (
-        f"Memories:\n{evidence}\n\n"
-        f"Question: {question}\n"
-        "Answer in complete sentences."
-    )
-
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg}
-        ],
-        "temperature": 0.2
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        if r.status_code != 200:
-            return f"❌ Groq API error: {r.status_code} - {r.text}"
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"❌ Groq request failed: {e}"
-
-# ---------- Local Q&A (no API) ----------
-def answer_locally(question, memories):
+# 5.3 Convert first-person → second-person ------------------------
+def _to_second_person(text: str) -> str:
     """
-    Super-simple rule-based answerer.
-    Looks at the most recent relevant memory and crafts a direct reply.
+    Very light rewrite so answers speak to the user.
+    Handles common cases: I/my/me → you/your/you; we/our → you/your.
+    """
+    if not text:
+        return ""
+
+    # order matters; do longest first
+    repl = [
+        (r"\bI am\b", "You are"),
+        (r"\bI'm\b", "You're"),
+        (r"\bI’ve\b", "You’ve"),
+        (r"\bI’d\b", "You’d"),
+        (r"\bI’ll\b", "You’ll"),
+        (r"\bI\b", "You"),
+        (r"\bmy\b", "your"),
+        (r"\bme\b", "you"),
+        (r"\bour\b", "your"),
+        (r"\bours\b", "yours"),
+        (r"\bwe\b", "you"),
+        (r"\bus\b", "you"),
+    ]
+    out = " " + text + " "
+    for pat, sub in repl:
+        out = re.sub(pat, sub, out, flags=re.IGNORECASE)
+    return out.strip().rstrip(".")  # keep it tidy
+
+# 5.4 Pickle’s personality tag (domain-aware) --------------------
+import random
+
+def personality_response(memory_text, question):
+    """
+    Generate a second-person, personality-rich response without using an LLM.
+    This uses predefined templates and adds subtle humor or warmth.
+    """
+
+    templates = [
+        f"Here's what you've got: {memory_text}. Go get it done! 💪",
+        f"Don't forget — {memory_text}. You're going to rock it! 🌟",
+        f"You've got this coming up: {memory_text}. Stay sharp! ⚡",
+        f"Hey, just a heads up — {memory_text}. Make it count! ✨",
+        f"Mark your calendar: {memory_text}. And don't be late! ⏰",
+        f"Get ready! {memory_text}. You're unstoppable. 🚀",
+        f"Friendly reminder: {memory_text}. You’ll handle it like a pro. 😎"
+    ]
+
+    # Pick a random template
+    response = random.choice(templates)
+
+    # Add extra flair for certain keywords
+    lower_text = memory_text.lower()
+    if "birthday" in lower_text:
+        response += " 🎂 Don't forget to wish them from me too!"
+    elif "interview" in lower_text:
+        response += " 🤝 Go crush it, you've got this!"
+    elif "football" in lower_text or "game" in lower_text:
+        response += " ⚽ Bring your A-game and have fun!"
+    
+    return response
+
+# 5.5 Choose best memory for a question --------------------------
+def _pick_best_memory(question: str, memories: list[dict]) -> dict | None:
+    """
+    Score each memory by token overlap + small importance boost; return best.
+    Memory shape assumed: { 'memory_text': str, 'importance': int, ... }
     """
     if not memories:
-        return "I don't have any memories yet."
+        return None
 
-    # Use the newest of the currently relevant memories
-    mem = memories[-1]  # since Results display reversed order
-    text = mem["text"]
-    q = question.lower()
+    q_tokens = set(_tokens(question))
+    if not q_tokens:
+        return None
 
-    # WHEN / TIME
-    if any(w in q for w in ["when", "what time", "time", "date", "day"]):
-        return f"According to your memory: {text}"
+    best = None
+    best_score = -1
+    for m in memories:
+        text = m.get("memory_text", "") or m.get("text", "")
+        m_tokens = set(_tokens(text))
+        overlap = len(q_tokens & m_tokens)
+        score = overlap * 10 + int(m.get("importance", 3))  # overlap dominates; importance nudges
+        if score > best_score:
+            best, best_score = m, score
 
-    # WHERE / VENUE
-    if any(w in q for w in ["where", "venue", "stadium"]):
-        m = re.search(r"\b(?:at|in)\s+([A-Z][A-Za-z0-9&\-\s']+)", text)
-        venue = m.group(1).strip() if m else None
-        return f"At {venue}." if venue else f"According to your memory: {text}"
+    return best if best_score > 0 else None
 
-    # WHO / OPPONENT
-    if any(w in q for w in ["who", "opponent", "playing", "versus", "vs"]):
-        m = re.search(r"\b(?:vs\.?|v\.?)\s+([A-Z][A-Za-z0-9&\-\s']+)", text, flags=re.I)
-        opp = m.group(1).strip() if m else None
-        return f"{opp}." if opp else f"According to your memory: {text}"
+# 5.6 Public API used by the UI
+def answer_question_from_memories(question: str, memories: list[dict]) -> str:
+    """
+    Returns a short second-person answer with personality.
+    - Normal questions  -> best single memory
+    - Multi-task questions (today/to-do/etc.) -> top few memories as a bullet list
+    """
+    if not memories:
+        return "I don't know."
 
-    # Default: just echo the most relevant memory
-    return f"According to your memory: {text}"
+    q_tokens = set(_tokens(question))
+    if not q_tokens:
+        return "I don't know."
 
-st.subheader("🗣️ Ask Pickle (natural question)")
-st.caption("Uses Groq AI if available; falls back to local demo mode if not.")
+    # Rank memories by simple token overlap
+    ranked = []
+    for m in memories:
+        text = m.get("memory_text", "") or m.get("text", "")
+        if not text:
+            continue
+        score = _score_overlap(q_tokens, text)
+        if score > 0:
+            # slight importance boost if present
+            score = score * 10 + int(m.get("importance", 3))
+            ranked.append((score, text))
 
-question = st.text_input("Your question", placeholder="e.g., When is Arsenal playing?")
+    if not ranked:
+        return "I don't know."
 
-if question.strip():
-    # Show relevant memories to Groq
-    context_memories = filtered if search_term.strip() else all_memories
+    ranked.sort(key=lambda t: t[0], reverse=True)
 
-    # Try Groq first
-    groq_answer = ask_groq(question, context_memories)
+    # If the question sounds like a list/today/todo → combine several
+    if _wants_multi(question):
+        top_texts = [t for _, t in ranked[:5]]  # show up to 5 items
+        if not top_texts:
+            return "I don't know."
+        bullets = ["• " + _to_second_person(txt) for txt in top_texts]
+        body = "\n".join(bullets)  # personality_response will add a nice opener
+        return personality_response(body, question)
 
-    if groq_answer is None:
-        # No API key detected
-        st.warning("⚠️ No Groq API key found — running in local mode.")
-        reply = answer_locally(question, context_memories)
-        st.success(reply)
+    # Otherwise return the best single match
+    best_text = ranked[0][1]
+    body = _to_second_person(best_text)
+    return personality_response(body, question)  # keep your personality/emoji system
 
-    elif groq_answer.startswith("❌"):
-        # Groq returned an error
-        st.warning(groq_answer)
-        reply = answer_locally(question, context_memories)
-        st.success(reply)
+# ========================== END MATCHER ==========================
+# ===================
+# 6) PAGE STRUCTURE
+# ===================
 
+st.title("🧠 Pickle Mini — Personal Memory Assistant")            # title
+st.markdown('<div class="small-muted">Save memories. Search them. Ask natural questions (private to you).</div>',
+            unsafe_allow_html=True)                               # subtitle
+st.divider()                                                      # separator
+
+# ---- two columns: save (left) / search (right) ----
+left, right = st.columns([1, 1])                                  # create columns
+
+with left:                                                        # LEFT: save memory:
+    st.subheader("📝 Save a new memory")
+
+    # ----------------------------
+    # 1) Keep widget state in SS
+    # ----------------------------
+    if "memory_input" not in st.session_state:
+        st.session_state.memory_input = ""          # textarea content
+    if "importance_val" not in st.session_state:
+        st.session_state.importance_val = 3         # slider value
+    if "last_save_ok" not in st.session_state:
+        st.session_state.last_save_ok = None        # last save result
+
+    # ----------------------------
+    # 2) Define a single callback
+    #    (runs when the Save button is clicked)
+    # ----------------------------
+    def handle_save():
+        text = st.session_state.memory_input.strip()
+        imp  = int(st.session_state.importance_val)
+        if text:
+            ok = save_memory_to_db(user_id, text, imp)
+            st.session_state.last_save_ok = ok
+            # SAFE reset inside callback
+            st.session_state.memory_input = ""
+        else:
+            st.session_state.last_save_ok = None
+
+    # ----------------------------
+    # 3) Render widgets
+    # ----------------------------
+    st.text_area(
+        "What should I remember?",
+        key="memory_input",
+        height=120,
+        placeholder="E.g., Arsenal are playing Newcastle this Sunday at 4:30 PM"
+    )
+
+    st.slider(
+        "Importance (1 low → 5 high)",
+        1, 5, key="importance_val"
+    )
+
+    st.button("Save memory", type="primary", on_click=handle_save)
+
+    # ----------------------------
+    # 4) Feedback from last action
+    # ----------------------------
+    if st.session_state.last_save_ok is True:
+        st.success("Memory saved!")
+        # reset the flag so the message doesn’t re-appear after reruns
+        st.session_state.last_save_ok = None
+    elif st.session_state.last_save_ok is False:
+        st.error("Couldn't save. Try again.")
+        st.session_state.last_save_ok = None
+    elif st.session_state.last_save_ok is None:
+        # do nothing (covers first load or empty input case)
+        pass
+  
+with right:                                                       # RIGHT: search + results
+    st.subheader("🔎 Search memories")
+    search_term = st.text_input("Type a word to filter", placeholder="e.g., Arsenal, physio, mum")
+    filtered = load_memories_from_db(user_id, search_term)       # filtered list
+    st.write(f"Results: {len(filtered)}")
+    for m in filtered:
+        st.markdown(
+            f"- {m['memory_text']}  \n"
+            f"<span class='small-muted'>(saved {m['created_at']}, importance {m['importance']})</span>",
+            unsafe_allow_html=True
+        )
+
+st.divider()                                                      # separator below columns
+
+# ---- Q&A block ----
+# ---- Q&A block ----
+st.subheader("🧠 Ask Pickle (natural question)")
+user_q = st.text_input("Your question", placeholder="e.g., What time are Arsenal playing?")
+
+if user_q.strip():
+    # Load all user memories
+    full_memories = load_memories_from_db(user_id, "")
+
+    # Compute the base answer
+    ans = answer_question_from_memories(user_q, full_memories)
+
+    # If no match found
+    if ans == "I don't know.":
+        st.warning(ans)
     else:
-        # Groq successfully answered
-        st.success(groq_answer)
+        # Add personality to the answer
+        st.success(ans)
+
+    # Debugging info
+    with st.expander("🧳 Debug (optional)"):
+        st.markdown("<div class='debug-box'>", unsafe_allow_html=True)
+        st.write({"question": user_q})
+        st.write({"matched_from": (full_memories[0] if full_memories else None)})
+        st.markdown("</div>", unsafe_allow_html=True)
+
+else:
+    st.info("Ask about something you've saved, e.g., 'Who are Arsenal playing?'")
